@@ -6,11 +6,13 @@ const path = require('path');
 const { PDFDocument } = require('pdf-lib');
 const { getBrowser, closeBrowser, closeAllBrowsers, createContext, blockResources } = require('./browser');
 
-const CHUNK_CHARS = 150_000;
-const MAX_RETRIES = 2;
-const CONCURRENCY = Math.min(3, Math.max(1, Math.floor(os.cpus().length / 2)));
-const RESTART_EVERY = 15;
-const CHUNK_PAGE_THRESHOLD = 1000;
+const CHARS_PER_PAGE      = 3000;
+const CHUNK_PAGE_MIN      = 100;               // minimum pages per chunk
+const CHUNK_CHARS         = CHARS_PER_PAGE * CHUNK_PAGE_MIN; // 300,000 chars
+const MAX_RETRIES         = 2;
+const CONCURRENCY         = Math.min(3, Math.max(1, Math.floor(os.cpus().length / 2)));
+const RESTART_EVERY       = 15;
+const CHUNK_PAGE_THRESHOLD = 1000;             // only chunk docs >= 1000 estimated pages
 
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
