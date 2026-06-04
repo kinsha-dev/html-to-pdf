@@ -21,8 +21,9 @@ function extractHead(html) {
 }
 
 function extractBody(html) {
-  const m = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-  return m ? m[1] : html;
+  const m = html.match(/<body([^>]*)>([\s\S]*?)<\/body>/i);
+  // Return both the body attributes and inner content
+  return m ? { attrs: m[1], content: m[2] } : { attrs: '', content: html };
 }
 
 function splitBodySafe(body, targetChars) {
@@ -39,16 +40,16 @@ function splitBodySafe(body, targetChars) {
   return chunks.filter(c => c.trim());
 }
 
-function wrapChunk(bodyChunk, head) {
-  return `<!DOCTYPE html><html><head>${head}</head><body>${bodyChunk}</body></html>`;
+function wrapChunk(bodyChunk, head, bodyAttrs = '') {
+  return `<!DOCTYPE html><html><head>${head}</head><body${bodyAttrs}>${bodyChunk}</body></html>`;
 }
 
 // ── Temp file helpers ──────────────────────────────────────────────────────────
-function writeChunkFiles(bodyChunks, head) {
+function writeChunkFiles(bodyChunks, head, bodyAttrs = '') {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'html-pdf-'));
   const paths = bodyChunks.map((chunk, i) => {
     const p = path.join(tmpDir, `chunk-${String(i).padStart(5, '0')}.html`);
-    fs.writeFileSync(p, wrapChunk(chunk, head), 'utf8');
+    fs.writeFileSync(p, wrapChunk(chunk, head, bodyAttrs), 'utf8');
     return p;
   });
   return { tmpDir, paths };
@@ -74,8 +75,8 @@ async function renderFile(tmpPath, options, workerId) {
   await blockResources(page);
 
   try {
-    await page.goto(`file://${tmpPath}`, { waitUntil: 'domcontentloaded', timeout: 120000 });
-    await page.waitForTimeout(150);
+    await page.goto(`file://${tmpPath}`, { waitUntil: 'load', timeout: 120000 });
+    await page.waitForTimeout(300); // let web fonts & CSS transitions settle
     return await page.pdf({ format, margin, printBackground, displayHeaderFooter });
   } finally {
     try { await page.close();    } catch (_) {}
@@ -101,7 +102,7 @@ async function renderWithFallback(tmpPath, options, workerId, depth = 0) {
       if (isPrintFail && depth < 3) {
         const html = fs.readFileSync(tmpPath, 'utf8');
         const head = extractHead(html);
-        const body = extractBody(html);
+        const { attrs: bodyAttrs, content: body } = extractBody(html);
         const mid  = body.lastIndexOf('>', Math.floor(body.length / 2));
         const cut  = mid > 0 ? mid + 1 : Math.floor(body.length / 2);
 
@@ -109,8 +110,8 @@ async function renderWithFallback(tmpPath, options, workerId, depth = 0) {
         const base  = path.basename(tmpPath, '.html');
         const pathA = path.join(dir, `${base}-a${depth}.html`);
         const pathB = path.join(dir, `${base}-b${depth}.html`);
-        fs.writeFileSync(pathA, wrapChunk(body.slice(0, cut), head), 'utf8');
-        fs.writeFileSync(pathB, wrapChunk(body.slice(cut),    head), 'utf8');
+        fs.writeFileSync(pathA, wrapChunk(body.slice(0, cut), head, bodyAttrs), 'utf8');
+        fs.writeFileSync(pathB, wrapChunk(body.slice(cut),    head, bodyAttrs), 'utf8');
 
         const [bufA, bufB] = await Promise.all([
           renderWithFallback(pathA, options, workerId, depth + 1),
@@ -163,16 +164,16 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
   }
 
   // Large document
-  const head       = extractHead(htmlContent);
-  const body       = extractBody(htmlContent);
-  const bodyChunks = splitBodySafe(body, CHUNK_CHARS);
+  const head                        = extractHead(htmlContent);
+  const { attrs: bodyAttrs, content: body } = extractBody(htmlContent);
+  const bodyChunks                  = splitBodySafe(body, CHUNK_CHARS);
 
   if (progress) {
     progress.total = bodyChunks.length;
     progress.log(`${bodyChunks.length} chunks  concurrency=${CONCURRENCY}  writing temp files...`);
   }
 
-  const { tmpDir, paths } = writeChunkFiles(bodyChunks, head);
+  const { tmpDir, paths } = writeChunkFiles(bodyChunks, head, bodyAttrs);
   if (progress) progress.log('Rendering chunks...');
 
   const mergedDoc = await PDFDocument.create();

@@ -54,7 +54,7 @@ async function createContext(browser) {
     bypassCSP: true,
     ignoreHTTPSErrors: true,
     viewport: { width: 1200, height: 800 },
-    javaScriptEnabled: false,
+    javaScriptEnabled: true, // required for CSS-in-JS and layout-affecting scripts
   });
 }
 
@@ -62,8 +62,9 @@ async function blockResources(page) {
   await page.route('**/*', async route => {
     const type = route.request().resourceType();
     const url  = route.request().url();
-    if (!['document', 'stylesheet'].includes(type)) return route.abort();
-    const blocked = ['analytics', 'tracking', 'google-analytics', 'facebook', 'hotjar', 'segment', 'gtm'];
+    // Allow document, stylesheet, script, font — block only tracking/analytics/media
+    if (['image', 'media', 'websocket', 'eventsource'].includes(type)) return route.abort();
+    const blocked = ['analytics', 'google-analytics', 'facebook', 'hotjar', 'segment', 'gtm', 'doubleclick'];
     if (blocked.some(p => url.includes(p))) return route.abort();
     return route.continue();
   });
