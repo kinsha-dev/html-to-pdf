@@ -7,13 +7,18 @@ const LAUNCH_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
   '--disable-gpu',
-  '--single-process',
   '--disable-web-security',
-  '--disable-features=IsolateOrigins,site-per-process',
   '--disable-site-isolation-trials',
   '--disable-background-networking',
   '--disable-sync',
   '--disable-default-apps',
+  '--disable-extensions',
+  '--disable-background-timer-throttling',
+  '--disable-renderer-backgrounding',
+  '--js-flags=--max-old-space-size=512',
+  '--aggressive-cache-discard',
+  '--disable-cache',
+  '--disable-application-cache',
 ];
 
 let browserInstance = null;
@@ -21,38 +26,35 @@ let browserInstance = null;
 async function getBrowser() {
   if (!browserInstance) {
     browserInstance = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
+    browserInstance.on('disconnected', () => { browserInstance = null; });
   }
   return browserInstance;
 }
 
 async function closeBrowser() {
   if (browserInstance) {
-    await browserInstance.close();
+    try { await browserInstance.close(); } catch (_) {}
     browserInstance = null;
   }
 }
 
+// Create a reusable context (caller manages lifetime)
 async function createContext(browser) {
   return browser.newContext({
     bypassCSP: true,
     ignoreHTTPSErrors: true,
     viewport: { width: 1200, height: 800 },
+    javaScriptEnabled: false,
   });
 }
 
 async function blockResources(page) {
   await page.route('**/*', async route => {
-    const url = route.request().url();
     const type = route.request().resourceType();
-
-    const blockedTypes = ['image', 'media'];
-    const blockedPatterns = ['analytics', 'tracking', 'google-analytics', 'facebook', 'hotjar', 'segment'];
-    const blockedExtensions = ['.woff', '.woff2', '.ttf', '.otf', '.eot'];
-
-    if (blockedTypes.includes(type)) return route.abort();
-    if (blockedPatterns.some(p => url.includes(p))) return route.abort();
-    if (blockedExtensions.some(ext => url.split('?')[0].endsWith(ext))) return route.abort();
-
+    const url = route.request().url();
+    if (!['document', 'stylesheet'].includes(type)) return route.abort();
+    const blocked = ['analytics', 'tracking', 'google-analytics', 'facebook', 'hotjar', 'segment', 'gtm'];
+    if (blocked.some(p => url.includes(p))) return route.abort();
     return route.continue();
   });
 }

@@ -8,6 +8,7 @@ const path = require('path');
 const { generatePdf } = require('./src/generator');
 const { closeBrowser } = require('./src/browser');
 const { StatsTracker } = require('./src/stats');
+const { Progress } = require('./src/progress');
 
 function printStats({ elapsed, peakMemMB, endMemMB, cpu, pages, chunks, inputBytes, outputBytes }) {
   const sep = chalk.gray('─'.repeat(44));
@@ -60,6 +61,8 @@ program
     console.log(chalk.gray('Generating PDF...'));
 
     const tracker = new StatsTracker();
+    // Start with 1; generator updates progress.total once it knows the real chunk count
+    const progress = new Progress(1);
 
     try {
       const { buffer, pages, chunks } = await generatePdf(
@@ -75,7 +78,7 @@ program
             right: opts.marginRight,
           },
         },
-        (done, total) => process.stderr.write(`  Chunk ${done}/${total} done\r`)
+        progress
       );
 
       fs.writeFileSync(outputPath, buffer);
