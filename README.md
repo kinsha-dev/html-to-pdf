@@ -4,6 +4,18 @@ Convert HTML files to PDF using Playwright + Chromium headless rendering. Suppor
 
 ---
 
+## Screenshots
+
+### Web UI
+
+![Web UI — conversion complete](docs/screenshot-UI.png)
+
+### CLI
+
+![CLI — terminal output with stats](docs/screenshot-cli.png)
+
+---
+
 ## Features
 
 - Accurate CSS rendering via Playwright + Chromium (latest)
