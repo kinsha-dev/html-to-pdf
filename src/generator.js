@@ -21,9 +21,52 @@ function extractHead(html) {
 }
 
 function extractBody(html) {
+  // Try explicit <body>...</body>
   const m = html.match(/<body([^>]*)>([\s\S]*?)<\/body>/i);
-  // Return both the body attributes and inner content
-  return m ? { attrs: m[1], content: m[2] } : { attrs: '', content: html };
+  if (m) return { attrs: m[1], content: m[2] };
+  // Try <html>...</html> without a body tag
+  const h = html.match(/<html[^>]*>([\s\S]*?)<\/html>/i);
+  if (h) {
+    // Strip any <head> block from it
+    const inner = h[1].replace(/<head[^>]*>[\s\S]*?<\/head>/i, '');
+    return { attrs: '', content: inner };
+  }
+  return { attrs: '', content: html };
+}
+
+// Detect sparse/plain HTML: has significant plain-text line structure but no
+// layout elements (no <p>, <div>, <table>, <br> etc.)
+const LAYOUT_TAG_RE = /<(p|div|br|hr|table|tr|td|th|ul|ol|li|h[1-6]|pre|code|blockquote|center|section|article|header|footer|nav|aside|form|input|textarea|button)\b/i;
+const HAS_STYLE_RE  = /<style[\s>]|<link[^>]+stylesheet/i;
+
+function isSparseHtml(html) {
+  const { content } = extractBody(html);
+  const stripped = content.replace(/<!--[\s\S]*?-->/g, '');
+  // No layout tags and no embedded styles = sparse/preformatted content
+  return !LAYOUT_TAG_RE.test(stripped) && !HAS_STYLE_RE.test(html);
+}
+
+// Wrap sparse HTML so whitespace and line breaks are preserved
+function normalizeSparseHtml(html) {
+  const head = extractHead(html);
+  const { attrs, content } = extractBody(html);
+  const style = `
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        font-family: 'Courier New', Courier, monospace;
+        font-size: 11pt;
+        line-height: 1.6;
+        color: #000;
+        background: #fff;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        padding: 16px 24px;
+        margin: 0;
+      }
+    </style>
+  `;
+  return `<!DOCTYPE html><html><head>${head}${style}</head><body${attrs}>${content}</body></html>`;
 }
 
 function splitBodySafe(body, targetChars) {
@@ -146,6 +189,12 @@ async function streamMerge(mergedDoc, pdfBuffer) {
 
 // ── Main entry ─────────────────────────────────────────────────────────────────
 async function generatePdf(htmlContent, options = {}, progress = null) {
+  // Normalize sparse/preformatted HTML before anything else
+  if (isSparseHtml(htmlContent)) {
+    if (progress) progress.log('Sparse HTML detected — adding white-space:pre-wrap + monospace');
+    htmlContent = normalizeSparseHtml(htmlContent);
+  }
+
   const estimatedPages = Math.ceil(htmlContent.length / 3000);
 
   if (estimatedPages < CHUNK_PAGE_THRESHOLD) {
