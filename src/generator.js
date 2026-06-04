@@ -42,31 +42,59 @@ const HAS_STYLE_RE  = /<style[\s>]|<link[^>]+stylesheet/i;
 function isSparseHtml(html) {
   const { content } = extractBody(html);
   const stripped = content.replace(/<!--[\s\S]*?-->/g, '');
-  // No layout tags and no embedded styles = sparse/preformatted content
   return !LAYOUT_TAG_RE.test(stripped) && !HAS_STYLE_RE.test(html);
 }
 
-// Wrap sparse HTML so whitespace and line breaks are preserved
+const SPARSE_STYLE = `<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin: 0; padding: 0; background: #fff; color: #000; }
+  pre {
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 11pt;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    word-break: break-word;
+    padding: 16px 24px;
+    margin: 0;
+  }
+  @media print {
+    pre { font-family: 'Courier New', Courier, monospace; font-size: 11pt;
+          line-height: 1.6; white-space: pre-wrap; }
+  }
+</style>`;
+
+// Normalise line endings and escape HTML entities, preserving <b> and <i>
+function escapeSparse(text) {
+  return text
+    .replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/&lt;b&gt;/gi, '<b>').replace(/&lt;\/b&gt;/gi, '</b>')
+    .replace(/&lt;i&gt;/gi, '<i>').replace(/&lt;\/i&gt;/gi, '</i>');
+}
+
+// For single-render docs: wrap whole body in one <pre>
 function normalizeSparseHtml(html) {
   const head = extractHead(html);
   const { attrs, content } = extractBody(html);
-  const style = `
-    <style>
-      * { box-sizing: border-box; }
-      body {
-        font-family: 'Courier New', Courier, monospace;
-        font-size: 11pt;
-        line-height: 1.6;
-        color: #000;
-        background: #fff;
-        white-space: pre-wrap;
-        word-wrap: break-word;
-        padding: 16px 24px;
-        margin: 0;
-      }
-    </style>
-  `;
-  return `<!DOCTYPE html><html><head>${head}${style}</head><body${attrs}>${content}</body></html>`;
+  return `<!DOCTYPE html><html><head>${head}${SPARSE_STYLE}</head><body${attrs}><pre>${escapeSparse(content)}</pre></body></html>`;
+}
+
+// Split plain text at newline boundaries so we never cut inside a line
+function splitTextChunks(text, targetChars) {
+  const chunks = [];
+  let pos = 0;
+  while (pos < text.length) {
+    let end = pos + targetChars;
+    if (end >= text.length) { chunks.push(text.slice(pos)); break; }
+    // Walk back to the last newline before the cut point
+    const nl = text.lastIndexOf('\n', end);
+    const cut = nl > pos ? nl + 1 : end;
+    chunks.push(text.slice(pos, cut));
+    pos = cut;
+  }
+  return chunks.filter(c => c.trim());
 }
 
 function splitBodySafe(body, targetChars) {
@@ -83,16 +111,18 @@ function splitBodySafe(body, targetChars) {
   return chunks.filter(c => c.trim());
 }
 
-function wrapChunk(bodyChunk, head, bodyAttrs = '') {
-  return `<!DOCTYPE html><html><head>${head}</head><body${bodyAttrs}>${bodyChunk}</body></html>`;
+function wrapChunk(bodyChunk, head, bodyAttrs = '', sparse = false) {
+  const extraHead = sparse ? SPARSE_STYLE : '';
+  const inner     = sparse ? `<pre>${bodyChunk}</pre>` : bodyChunk;
+  return `<!DOCTYPE html><html><head>${head}${extraHead}</head><body${bodyAttrs}>${inner}</body></html>`;
 }
 
 // ── Temp file helpers ──────────────────────────────────────────────────────────
-function writeChunkFiles(bodyChunks, head, bodyAttrs = '') {
+function writeChunkFiles(bodyChunks, head, bodyAttrs = '', sparse = false) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'html-pdf-'));
   const paths = bodyChunks.map((chunk, i) => {
     const p = path.join(tmpDir, `chunk-${String(i).padStart(5, '0')}.html`);
-    fs.writeFileSync(p, wrapChunk(chunk, head, bodyAttrs), 'utf8');
+    fs.writeFileSync(p, wrapChunk(chunk, head, bodyAttrs, sparse), 'utf8');
     return p;
   });
   return { tmpDir, paths };
@@ -189,16 +219,17 @@ async function streamMerge(mergedDoc, pdfBuffer) {
 
 // ── Main entry ─────────────────────────────────────────────────────────────────
 async function generatePdf(htmlContent, options = {}, progress = null) {
-  // Normalize sparse/preformatted HTML before anything else
-  if (isSparseHtml(htmlContent)) {
-    if (progress) progress.log('Sparse HTML detected — adding white-space:pre-wrap + monospace');
-    htmlContent = normalizeSparseHtml(htmlContent);
-  }
-
+  const sparse = isSparseHtml(htmlContent);
   const estimatedPages = Math.ceil(htmlContent.length / 3000);
 
   if (estimatedPages < CHUNK_PAGE_THRESHOLD) {
-    if (progress) progress.log('Single render (small document)');
+    // Single render — normalize entire doc if sparse, write as-is otherwise
+    if (sparse) {
+      if (progress) progress.log('Sparse HTML detected — wrapping in <pre> (single render)');
+      htmlContent = normalizeSparseHtml(htmlContent);
+    } else {
+      if (progress) progress.log('Single render (small document)');
+    }
     const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), 'html-pdf-'));
     const tmpPath = path.join(tmpDir, 'doc.html');
     fs.writeFileSync(tmpPath, htmlContent, 'utf8');
@@ -212,17 +243,28 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
     }
   }
 
-  // Large document
-  const head                        = extractHead(htmlContent);
-  const { attrs: bodyAttrs, content: body } = extractBody(htmlContent);
-  const bodyChunks                  = splitBodySafe(body, CHUNK_CHARS);
+  // Large document — extract body, split raw text, wrap each chunk individually
+  const head = extractHead(htmlContent);
+  const { attrs: bodyAttrs, content: rawBody } = extractBody(htmlContent);
+
+  // For sparse docs: escape text first, then split — each chunk gets its own <pre>
+  // For rich HTML: split at tag boundaries as usual
+  let bodyChunks;
+  if (sparse) {
+    if (progress) progress.log('Sparse HTML detected — wrapping each chunk in <pre>');
+    const escaped = escapeSparse(rawBody);
+    // Plain-text split on newline boundaries (not tag boundaries)
+    bodyChunks = splitTextChunks(escaped, CHUNK_CHARS);
+  } else {
+    bodyChunks = splitBodySafe(rawBody, CHUNK_CHARS);
+  }
 
   if (progress) {
     progress.total = bodyChunks.length;
     progress.log(`${bodyChunks.length} chunks  concurrency=${CONCURRENCY}  writing temp files...`);
   }
 
-  const { tmpDir, paths } = writeChunkFiles(bodyChunks, head, bodyAttrs);
+  const { tmpDir, paths } = writeChunkFiles(bodyChunks, head, bodyAttrs, sparse);
   if (progress) progress.log('Rendering chunks...');
 
   const mergedDoc = await PDFDocument.create();
