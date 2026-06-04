@@ -1,0 +1,22 @@
+{
+  "name": "html-to-pdf",
+  "version": "1.0.0",
+  "main": "cli.js",
+  "bin": {
+    "html-to-pdf": "./cli.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "Convert HTML files to PDF using Playwright + Chromium",
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^15.0.0",
+    "p-limit": "^4.0.0",
+    "pdf-lib": "^1.17.1",
+    "playwright": "^1.60.0"
+  }
+}
