@@ -15,30 +15,40 @@ const LAUNCH_ARGS = [
   '--disable-extensions',
   '--disable-background-timer-throttling',
   '--disable-renderer-backgrounding',
-  '--js-flags=--max-old-space-size=512',
+  '--js-flags=--max-old-space-size=384',
   '--aggressive-cache-discard',
   '--disable-cache',
   '--disable-application-cache',
 ];
 
-let browserInstance = null;
+// Per-worker browser registry — keyed by workerId
+const browsers = new Map();
 
-async function getBrowser() {
-  if (!browserInstance) {
-    browserInstance = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
-    browserInstance.on('disconnected', () => { browserInstance = null; });
+async function getBrowser(workerId = 'default') {
+  let b = browsers.get(workerId);
+  if (!b || !b.isConnected()) {
+    b = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
+    b.on('disconnected', () => browsers.delete(workerId));
+    browsers.set(workerId, b);
   }
-  return browserInstance;
+  return b;
 }
 
-async function closeBrowser() {
-  if (browserInstance) {
-    try { await browserInstance.close(); } catch (_) {}
-    browserInstance = null;
+async function closeBrowser(workerId = 'default') {
+  const b = browsers.get(workerId);
+  if (b) {
+    try { await b.close(); } catch (_) {}
+    browsers.delete(workerId);
   }
 }
 
-// Create a reusable context (caller manages lifetime)
+async function closeAllBrowsers() {
+  for (const [id, b] of browsers) {
+    try { await b.close(); } catch (_) {}
+    browsers.delete(id);
+  }
+}
+
 async function createContext(browser) {
   return browser.newContext({
     bypassCSP: true,
@@ -51,7 +61,7 @@ async function createContext(browser) {
 async function blockResources(page) {
   await page.route('**/*', async route => {
     const type = route.request().resourceType();
-    const url = route.request().url();
+    const url  = route.request().url();
     if (!['document', 'stylesheet'].includes(type)) return route.abort();
     const blocked = ['analytics', 'tracking', 'google-analytics', 'facebook', 'hotjar', 'segment', 'gtm'];
     if (blocked.some(p => url.includes(p))) return route.abort();
@@ -59,4 +69,4 @@ async function blockResources(page) {
   });
 }
 
-module.exports = { getBrowser, closeBrowser, createContext, blockResources };
+module.exports = { getBrowser, closeBrowser, closeAllBrowsers, createContext, blockResources };

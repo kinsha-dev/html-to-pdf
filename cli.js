@@ -6,7 +6,7 @@ const chalk = require('chalk');
 const fs = require('fs');
 const path = require('path');
 const { generatePdf } = require('./src/generator');
-const { closeBrowser } = require('./src/browser');
+const { closeAllBrowsers } = require('./src/browser');
 const { StatsTracker } = require('./src/stats');
 const { Progress } = require('./src/progress');
 
@@ -100,7 +100,7 @@ program
       console.error(chalk.red(`Error: ${err.message}`));
       process.exitCode = 1;
     } finally {
-      await closeBrowser();
+      await closeAllBrowsers();
     }
   });
 
