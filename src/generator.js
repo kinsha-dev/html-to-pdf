@@ -1,13 +1,12 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
+const os = require('os');
 const { PDFDocument } = require('pdf-lib');
 const pLimit = require('p-limit');
 const { getBrowser, createContext, blockResources } = require('./browser');
 
 const CHUNK_PAGE_THRESHOLD = 1000;
-const CHUNK_SIZE = 400; // estimated pages per chunk
+const CHUNK_SIZE = 400;
 
 async function renderHtmlToPdf(htmlContent, options = {}) {
   const {
@@ -38,14 +37,11 @@ async function renderHtmlToPdf(htmlContent, options = {}) {
 }
 
 function splitHtmlIntoChunks(htmlContent, chunkSize) {
-  // Split on top-level section/h1 boundaries
   const sectionRegex = /(?=<(?:h1|section|article)[^>]*>)/gi;
   const parts = htmlContent.split(sectionRegex).filter(Boolean);
 
   if (parts.length <= 1) {
-    // Fallback: split by estimated character count (~3000 chars per page)
-    const charsPerPage = 3000;
-    const charsPerChunk = charsPerPage * chunkSize;
+    const charsPerChunk = 3000 * chunkSize;
     const chunks = [];
     for (let i = 0; i < htmlContent.length; i += charsPerChunk) {
       chunks.push(htmlContent.slice(i, i + charsPerChunk));
@@ -53,7 +49,6 @@ function splitHtmlIntoChunks(htmlContent, chunkSize) {
     return chunks;
   }
 
-  // Group parts into chunks
   const chunks = [];
   for (let i = 0; i < parts.length; i += chunkSize) {
     chunks.push(parts.slice(i, i + chunkSize).join(''));
@@ -62,10 +57,14 @@ function splitHtmlIntoChunks(htmlContent, chunkSize) {
 }
 
 function wrapChunk(chunk, baseHtml) {
-  // Preserve <head> styles from original document for each chunk
   const headMatch = baseHtml.match(/<head[^>]*>([\s\S]*?)<\/head>/i);
   const head = headMatch ? headMatch[1] : '';
   return `<!DOCTYPE html><html><head>${head}</head><body>${chunk}</body></html>`;
+}
+
+async function countPdfPages(buffer) {
+  const doc = await PDFDocument.load(buffer);
+  return doc.getPageCount();
 }
 
 async function mergePdfs(pdfBuffers) {
@@ -78,35 +77,35 @@ async function mergePdfs(pdfBuffers) {
   return Buffer.from(await merged.save());
 }
 
-async function estimatePageCount(htmlContent) {
-  // Rough heuristic: 3000 chars ~ 1 page
-  return Math.ceil(htmlContent.length / 3000);
-}
+async function generatePdf(htmlContent, options = {}, onProgress = null) {
+  const estimatedPages = Math.ceil(htmlContent.length / 3000);
 
-async function generatePdf(htmlContent, options = {}) {
-  const estimated = await estimatePageCount(htmlContent);
-
-  if (estimated < CHUNK_PAGE_THRESHOLD) {
-    return renderHtmlToPdf(htmlContent, options);
+  if (estimatedPages < CHUNK_PAGE_THRESHOLD) {
+    const buffer = await renderHtmlToPdf(htmlContent, options);
+    const pages = await countPdfPages(buffer);
+    return { buffer, pages, chunks: 1 };
   }
 
-  // Large document: chunk + parallel render + merge
   const chunks = splitHtmlIntoChunks(htmlContent, CHUNK_SIZE);
   const wrappedChunks = chunks.map(c => wrapChunk(c, htmlContent));
-
-  const concurrency = Math.max(2, Math.floor(require('os').cpus().length * 1.5));
+  const concurrency = Math.max(2, Math.floor(os.cpus().length * 1.5));
   const limit = pLimit(concurrency);
 
+  let done = 0;
   const pdfParts = await Promise.all(
     wrappedChunks.map((chunk, i) =>
-      limit(() => {
-        process.stderr.write(`  Rendering chunk ${i + 1}/${wrappedChunks.length}...\n`);
-        return renderHtmlToPdf(chunk, options);
+      limit(async () => {
+        const buf = await renderHtmlToPdf(chunk, options);
+        done++;
+        if (onProgress) onProgress(done, wrappedChunks.length);
+        return buf;
       })
     )
   );
 
-  return mergePdfs(pdfParts);
+  const buffer = await mergePdfs(pdfParts);
+  const pages = await countPdfPages(buffer);
+  return { buffer, pages, chunks: wrappedChunks.length };
 }
 
 module.exports = { generatePdf };

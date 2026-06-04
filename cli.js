@@ -7,13 +7,32 @@ const fs = require('fs');
 const path = require('path');
 const { generatePdf } = require('./src/generator');
 const { closeBrowser } = require('./src/browser');
+const { StatsTracker } = require('./src/stats');
+
+function printStats({ elapsed, peakMemMB, endMemMB, cpu, pages, chunks, inputBytes, outputBytes }) {
+  const sep = chalk.gray('─'.repeat(44));
+  console.log('\n' + sep);
+  console.log(chalk.bold('  Generation Stats'));
+  console.log(sep);
+  console.log(`  ${'Time'.padEnd(18)} ${chalk.yellow(elapsed + 's')}`);
+  console.log(`  ${'Pages'.padEnd(18)} ${chalk.yellow(pages)}`);
+  if (chunks > 1) {
+    console.log(`  ${'Chunks'.padEnd(18)} ${chalk.yellow(chunks)}`);
+  }
+  console.log(`  ${'Peak Memory'.padEnd(18)} ${chalk.yellow(peakMemMB + ' MB')}`);
+  console.log(`  ${'End Memory (RSS)'.padEnd(18)} ${chalk.yellow(endMemMB + ' MB')}`);
+  console.log(`  ${'CPU (end)'.padEnd(18)} ${chalk.yellow(cpu + '%')}`);
+  console.log(`  ${'Input size'.padEnd(18)} ${chalk.yellow((inputBytes / 1024 / 1024).toFixed(2) + ' MB')}`);
+  console.log(`  ${'Output size'.padEnd(18)} ${chalk.yellow((outputBytes / 1024).toFixed(1) + ' KB')}`);
+  console.log(sep + '\n');
+}
 
 program
   .name('html-to-pdf')
   .description('Convert an HTML file to a PDF document')
   .version('1.0.0')
   .argument('<input>', 'Path to the HTML input file')
-  .option('-o, --output <path>', 'Output PDF file path (default: same name as input with .pdf)')
+  .option('-o, --output <path>', 'Output PDF file path (default: input name with .pdf)')
   .option('-f, --format <format>', 'Page format: A4, A3, Letter, Legal', 'A4')
   .option('--margin-top <size>', 'Top margin (CSS units)', '20mm')
   .option('--margin-bottom <size>', 'Bottom margin (CSS units)', '20mm')
@@ -40,27 +59,41 @@ program
     console.log(chalk.cyan(`Format: ${opts.format}`));
     console.log(chalk.gray('Generating PDF...'));
 
-    const start = Date.now();
+    const tracker = new StatsTracker();
 
     try {
-      const pdfBuffer = await generatePdf(htmlContent, {
-        format: opts.format,
-        printBackground: opts.background !== false,
-        displayHeaderFooter: !!opts.headerFooter,
-        margin: {
-          top: opts.marginTop,
-          bottom: opts.marginBottom,
-          left: opts.marginLeft,
-          right: opts.marginRight,
+      const { buffer, pages, chunks } = await generatePdf(
+        htmlContent,
+        {
+          format: opts.format,
+          printBackground: opts.background !== false,
+          displayHeaderFooter: !!opts.headerFooter,
+          margin: {
+            top: opts.marginTop,
+            bottom: opts.marginBottom,
+            left: opts.marginLeft,
+            right: opts.marginRight,
+          },
         },
+        (done, total) => process.stderr.write(`  Chunk ${done}/${total} done\r`)
+      );
+
+      fs.writeFileSync(outputPath, buffer);
+      const stats = tracker.stop();
+
+      console.log(chalk.green(`\nPDF written → ${outputPath}`));
+      printStats({
+        elapsed: stats.elapsedSec,
+        peakMemMB: stats.peakMemMB,
+        endMemMB: stats.endMemMB,
+        cpu: stats.cpuPercent,
+        pages,
+        chunks,
+        inputBytes: Buffer.byteLength(htmlContent),
+        outputBytes: buffer.length,
       });
-
-      fs.writeFileSync(outputPath, pdfBuffer);
-
-      const elapsed = ((Date.now() - start) / 1000).toFixed(2);
-      const sizeKb = (pdfBuffer.length / 1024).toFixed(1);
-      console.log(chalk.green(`Done in ${elapsed}s — ${sizeKb} KB → ${outputPath}`));
     } catch (err) {
+      tracker.stop();
       console.error(chalk.red(`Error: ${err.message}`));
       process.exitCode = 1;
     } finally {
