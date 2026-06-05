@@ -217,8 +217,8 @@ async function streamMerge(mergedDoc, pdfBuffer) {
   const doc   = await PDFDocument.load(pdfBuffer);
   const pages = await mergedDoc.copyPages(doc, doc.getPageIndices());
   pages.forEach(p => mergedDoc.addPage(p));
-  // FIX: pdf-lib holds parsed page objects — explicitly clear the loaded doc
-  doc.context.enumeratedIndirectObjects.clear();
+  // Note: don't call doc.context.enumeratedIndirectObjects.clear() —
+  // that's a private pdf-lib API that may be undefined on some PDF types
 }
 
 // ── Main entry ─────────────────────────────────────────────────────────────────
@@ -289,14 +289,21 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
   async function flushMerge() {
     if (lock.merging) return;
     lock.merging = true;
-    while (nextMerge < pdfParts.length && pdfParts[nextMerge] !== undefined) {
-      await streamMerge(mergedDoc, pdfParts[nextMerge]);
-      // FIX: null the buffer immediately after merging — was previously set to null
-      // but only inside the array slot, the buffer itself wasn't GC-eligible
-      pdfParts[nextMerge] = null;
-      nextMerge++;
+    try {
+      while (nextMerge < pdfParts.length && pdfParts[nextMerge] !== undefined) {
+        await streamMerge(mergedDoc, pdfParts[nextMerge]);
+        pdfParts[nextMerge] = null; // release buffer after merge
+        nextMerge++;
+      }
+    } catch (err) {
+      // Don't propagate merge errors — a failed merge is logged but must not
+      // kill sibling workers via Promise.all rejection (which would trigger
+      // cleanupTmpDir while other workers still need their chunk files)
+      if (progress) progress.log(`  merge error at chunk ${nextMerge}: ${err.message.slice(0, 80)}`);
+      nextMerge++; // skip the bad chunk and continue
+    } finally {
+      lock.merging = false;
     }
-    lock.merging = false;
   }
 
   async function worker(workerId) {
@@ -323,9 +330,9 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
       localCount++;
       if (progress) progress.tick();
 
-      // FIX: delete temp chunk file immediately after render — don't hold all
-      // chunk HTML files on disk for the entire job duration
-      try { fs.unlinkSync(paths[i]); } catch (_) {}
+      // NOTE: chunk files deleted in cleanupTmpDir after ALL workers finish,
+      // not here — deleting mid-job caused ERR_FILE_NOT_FOUND in sibling workers
+      // when flushMerge errors triggered early cleanup via Promise.all rejection
 
       await flushMerge();
     }
