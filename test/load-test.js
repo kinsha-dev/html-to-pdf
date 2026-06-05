@@ -24,9 +24,10 @@ const CALIBRATE_EVERY_MS  = 30_000;            // recalibrate every 30s
 const SAMPLE_WINDOW       = 10;                // requests in rolling window for avg RT
 const MAX_RESPONSE_MS     = 15_000;            // 15s ceiling
 const MAX_CPU_PCT         = 50;
-const MAX_MEM_PCT         = 50;
-const RT_SCALE_DOWN_MS    = 13_000;            // start backing off at 13s
-const RT_SCALE_UP_MS      = 8_000;             // scale up if avg RT < 8s
+const MEM_WARN_PCT        = 90;               // warn (but don't throttle) above this
+const RT_SCALE_DOWN_MS    = 13_000;            // back off when avg RT exceeds this
+const RT_SCALE_UP_MS      = 8_000;             // scale up only when avg RT below this
+const MIN_REQS_TO_SCALE_UP = 3;              // need at least N completed reqs in window
 const CONCURRENCY_MIN     = 1;
 const CONCURRENCY_MAX     = 16;
 const CONCURRENCY_INIT    = 1;
@@ -104,11 +105,13 @@ function avgRt() {
 }
 
 function calibrate(intervalStats) {
-  const { avgRtMs, cpuPct, memPct, successRate } = intervalStats;
+  const { avgRtMs, cpuPct, memPct, successRate, windowOkReqs } = intervalStats;
+  const ok  = windowOkReqs;
   const old = concurrency;
 
-  const overloaded = avgRtMs > RT_SCALE_DOWN_MS || cpuPct > MAX_CPU_PCT;
-  const healthy    = avgRtMs < RT_SCALE_UP_MS   && cpuPct < MAX_CPU_PCT * 0.8 && successRate === 1;
+  const hasEnoughSamples = ok >= MIN_REQS_TO_SCALE_UP;
+  const overloaded = (hasEnoughSamples && avgRtMs > RT_SCALE_DOWN_MS) || cpuPct > MAX_CPU_PCT;
+  const healthy    = hasEnoughSamples && avgRtMs < RT_SCALE_UP_MS && cpuPct < MAX_CPU_PCT * 0.8 && successRate === 1;
 
   if (overloaded && concurrency > CONCURRENCY_MIN) {
     concurrency = Math.max(CONCURRENCY_MIN, Math.floor(concurrency * 0.7));
@@ -210,8 +213,9 @@ async function run() {
       timestamp: new Date().toISOString(),
       elapsed,
       concurrency,
-      windowReqs: window.length,
-      totalReqs: results.requests.length,
+      windowReqs:    window.length,
+      windowOkReqs:  ok.length,
+      totalReqs:     results.requests.length,
       avgRtMs,
       p95RtMs,
       tps,
@@ -223,9 +227,10 @@ async function run() {
     intervalStats.calibration = adj;
     results.intervals.push(intervalStats);
 
-    const actionStr = adj.reason === 'scale-down' ? `↓ ${adj.from}→${adj.to} (overloaded)`
-                    : adj.reason === 'scale-up'   ? `↑ ${adj.from}→${adj.to} (healthy)`
-                    :                               '— hold';
+    const memWarn   = intervalStats.memPct > MEM_WARN_PCT ? ' ⚠ mem' : '';
+    const actionStr = (adj.reason === 'scale-down' ? `↓ ${adj.from}→${adj.to} (overloaded)`
+                    : adj.reason === 'scale-up'    ? `↑ ${adj.from}→${adj.to} (healthy)`
+                    :                                '— hold') + memWarn;
 
     printRow(elapsed, intervalStats, actionStr);
 
