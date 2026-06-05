@@ -4,14 +4,14 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const { PDFDocument } = require('pdf-lib');
-const { getBrowser, closeBrowser, closeAllBrowsers, createContext, blockResources } = require('./browser');
+const { blockResources } = require('./browser');
+const { pool: browserPool } = require('./browser-pool');
 
 const CHARS_PER_PAGE       = 3000;
-const CHUNK_PAGE_MIN       = 100;
-const CHUNK_CHARS          = CHARS_PER_PAGE * CHUNK_PAGE_MIN; // 300,000 chars
+const CHUNK_PAGE_MIN       = parseInt(process.env.CHUNK_PAGES || '200'); // 200 pages per chunk
+const CHUNK_CHARS          = CHARS_PER_PAGE * CHUNK_PAGE_MIN; // 600,000 chars default
 const MAX_RETRIES          = 2;
-const CONCURRENCY          = Math.min(3, Math.max(1, Math.floor(os.cpus().length / 2)));
-const RESTART_EVERY        = 15;
+const CONCURRENCY          = parseInt(process.env.RENDER_CONCURRENCY || '1'); // 1 = no OOM under load
 const CHUNK_PAGE_THRESHOLD = 1000;
 
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -125,8 +125,10 @@ function cleanupTmpDir(tmpDir) {
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
 }
 
-// ── Rendering ──────────────────────────────────────────────────────────────────
-async function renderFile(tmpPath, options, workerId) {
+// ── Rendering — shared context from global browser pool ───────────────────────
+// One context is created per job and shared across all chunks sequentially.
+// Pages are opened and closed per chunk — avoids context overhead per chunk.
+async function renderFile(tmpPath, options, context) {
   const {
     format = 'A4',
     margin = { top: '20mm', right: '15mm', bottom: '20mm', left: '15mm' },
@@ -134,37 +136,31 @@ async function renderFile(tmpPath, options, workerId) {
     displayHeaderFooter = false,
   } = options;
 
-  const browser = await getBrowser(workerId);
-  const context = await createContext(browser);
-  const page    = await context.newPage();
+  const page = await context.newPage();
   await page.setDefaultTimeout(120000);
   await blockResources(page);
 
   try {
     await page.goto(`file://${tmpPath}`, { waitUntil: 'load', timeout: 120000 });
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(200); // shorter wait — CSS loads synchronously from file://
     return await page.pdf({ format, margin, printBackground, displayHeaderFooter });
   } finally {
-    // FIX: always close page then context — prevents renderer process leaking
-    try { await page.close();    } catch (_) {}
-    try { await context.close(); } catch (_) {}
+    try { await page.close(); } catch (_) {}
   }
 }
 
-async function renderWithFallback(tmpPath, options, workerId, depth = 0) {
+async function renderWithFallback(tmpPath, options, context, depth = 0) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      return await renderFile(tmpPath, options, workerId);
+      return await renderFile(tmpPath, options, context);
     } catch (err) {
       const isPrintFail = /printToPDF|Printing failed/i.test(err.message);
       const isCrash     = /closed|crashed|disconnected|Target page/i.test(err.message);
 
-      if (isCrash) {
-        await closeBrowser(workerId);
-        await sleep(500 * attempt);
-      }
+      if (isCrash || attempt === MAX_RETRIES) throw err;
 
       if (isPrintFail && depth < 3) {
+        // Split chunk in half and render each half separately
         const html = fs.readFileSync(tmpPath, 'utf8');
         const head = extractHead(html);
         const { attrs: bodyAttrs, content: body } = extractBody(html);
@@ -180,10 +176,8 @@ async function renderWithFallback(tmpPath, options, workerId, depth = 0) {
 
         let bufA, bufB;
         try {
-          [bufA, bufB] = await Promise.all([
-            renderWithFallback(pathA, options, workerId, depth + 1),
-            renderWithFallback(pathB, options, workerId, depth + 1),
-          ]);
+          bufA = await renderWithFallback(pathA, options, context, depth + 1);
+          bufB = await renderWithFallback(pathB, options, context, depth + 1);
           const merged = await PDFDocument.create();
           for (const buf of [bufA, bufB]) {
             const doc   = await PDFDocument.load(buf);
@@ -192,16 +186,12 @@ async function renderWithFallback(tmpPath, options, workerId, depth = 0) {
           }
           return Buffer.from(await merged.save());
         } finally {
-          // FIX: always clean up fallback split files
           try { fs.unlinkSync(pathA); } catch (_) {}
           try { fs.unlinkSync(pathB); } catch (_) {}
-          // FIX: null out large buffers immediately after merge
-          bufA = null;
-          bufB = null;
+          bufA = null; bufB = null;
         }
       }
 
-      if (attempt === MAX_RETRIES) throw err;
       await sleep(1000 * attempt);
     }
   }
@@ -237,33 +227,35 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
     const tmpPath = path.join(tmpDir, 'doc.html');
     fs.writeFileSync(tmpPath, htmlContent, 'utf8');
 
-    // FIX: release input string reference — it can be 10s of MB
     htmlContent = null;
 
+    // Acquire warm browser from global pool — no cold start
+    const browser = await browserPool.acquire();
+    const context = await browser.newContext({
+      bypassCSP: false, ignoreHTTPSErrors: false,
+      javaScriptEnabled: true, permissions: [],
+      viewport: { width: 1200, height: 800 },
+    });
     try {
-      const buffer = await renderWithFallback(tmpPath, options, 'w0');
+      const buffer = await renderWithFallback(tmpPath, options, context);
       const pages  = await countPdfPages(buffer);
       return { buffer, pages, chunks: 1 };
     } finally {
+      try { await context.close(); } catch (_) {}
+      browserPool.release(browser);
       cleanupTmpDir(tmpDir);
-      // FIX: close browsers only for single render — chunked path closes per worker
-      await closeAllBrowsers();
     }
   }
 
-  // ── Large document path ────────────────────────────────────────────────────
+  // ── Large document path ─────────────────────────────────────────────────────
   const head = extractHead(htmlContent);
   const { attrs: bodyAttrs, content: rawBody } = extractBody(htmlContent);
-
-  // FIX: release the full htmlContent string — rawBody is a substring reference;
-  // assign null to allow GC of the original string once bodyChunks are built
   htmlContent = null;
 
   let bodyChunks;
   if (sparse) {
     if (progress) progress.log('Sparse HTML detected — wrapping each chunk in <pre>');
-    const escaped = escapeSparse(rawBody);
-    bodyChunks = splitTextChunks(escaped, CHUNK_CHARS);
+    bodyChunks = splitTextChunks(escapeSparse(rawBody), CHUNK_CHARS);
   } else {
     bodyChunks = splitBodySafe(rawBody, CHUNK_CHARS);
   }
@@ -274,9 +266,7 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
   }
 
   const { tmpDir, paths } = writeChunkFiles(bodyChunks, head, bodyAttrs, sparse);
-
-  // FIX: release chunk strings after writing to disk — no need to hold all in memory
-  bodyChunks.length = 0;
+  bodyChunks.length = 0; // release chunk strings
 
   if (progress) progress.log('Rendering chunks...');
 
@@ -292,60 +282,54 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
     try {
       while (nextMerge < pdfParts.length && pdfParts[nextMerge] !== undefined) {
         await streamMerge(mergedDoc, pdfParts[nextMerge]);
-        pdfParts[nextMerge] = null; // release buffer after merge
+        pdfParts[nextMerge] = null;
         nextMerge++;
       }
     } catch (err) {
-      // Don't propagate merge errors — a failed merge is logged but must not
-      // kill sibling workers via Promise.all rejection (which would trigger
-      // cleanupTmpDir while other workers still need their chunk files)
       if (progress) progress.log(`  merge error at chunk ${nextMerge}: ${err.message.slice(0, 80)}`);
-      nextMerge++; // skip the bad chunk and continue
+      nextMerge++;
     } finally {
       lock.merging = false;
     }
   }
 
+  // Each worker acquires ONE browser from the pool and ONE context.
+  // All chunks for that worker render sequentially inside the same context.
   async function worker(workerId) {
-    const wid = `w${workerId}`;
-    let localCount = 0;
-    while (true) {
-      const i = renderIdx++;
-      if (i >= paths.length) break;
+    const browser = await browserPool.acquire();
+    const context = await browser.newContext({
+      bypassCSP: false, ignoreHTTPSErrors: false,
+      javaScriptEnabled: true, permissions: [],
+      viewport: { width: 1200, height: 800 },
+    });
+    try {
+      while (true) {
+        const i = renderIdx++;
+        if (i >= paths.length) break;
 
-      if (localCount > 0 && localCount % RESTART_EVERY === 0) {
-        await closeBrowser(wid);
-        await sleep(300);
+        try {
+          pdfParts[i] = await renderWithFallback(paths[i], options, context);
+        } catch (err) {
+          if (progress) progress.log(`  chunk ${i} failed permanently: ${err.message.slice(0, 80)}`);
+          const blank = await PDFDocument.create();
+          blank.addPage();
+          pdfParts[i] = Buffer.from(await blank.save());
+        }
+
+        if (progress) progress.tick();
+        await flushMerge();
       }
-
-      try {
-        pdfParts[i] = await renderWithFallback(paths[i], options, wid);
-      } catch (err) {
-        if (progress) progress.log(`  chunk ${i} failed permanently: ${err.message.slice(0, 80)}`);
-        const blank = await PDFDocument.create();
-        blank.addPage();
-        pdfParts[i] = Buffer.from(await blank.save());
-      }
-
-      localCount++;
-      if (progress) progress.tick();
-
-      // NOTE: chunk files deleted in cleanupTmpDir after ALL workers finish,
-      // not here — deleting mid-job caused ERR_FILE_NOT_FOUND in sibling workers
-      // when flushMerge errors triggered early cleanup via Promise.all rejection
-
-      await flushMerge();
+    } finally {
+      try { await context.close(); } catch (_) {}
+      browserPool.release(browser);
     }
-    await closeBrowser(wid);
   }
 
   try {
     await Promise.all(Array.from({ length: CONCURRENCY }, (_, id) => worker(id)));
     await flushMerge();
   } finally {
-    // FIX: cleanupTmpDir catches any remaining files (fallback split files etc.)
     cleanupTmpDir(tmpDir);
-    await closeAllBrowsers();
   }
 
   const buffer = Buffer.from(await mergedDoc.save());
