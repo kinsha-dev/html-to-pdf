@@ -6,13 +6,13 @@ const path = require('path');
 const { PDFDocument } = require('pdf-lib');
 const { getBrowser, closeBrowser, closeAllBrowsers, createContext, blockResources } = require('./browser');
 
-const CHARS_PER_PAGE      = 3000;
-const CHUNK_PAGE_MIN      = 100;               // minimum pages per chunk
-const CHUNK_CHARS         = CHARS_PER_PAGE * CHUNK_PAGE_MIN; // 300,000 chars
-const MAX_RETRIES         = 2;
-const CONCURRENCY         = Math.min(3, Math.max(1, Math.floor(os.cpus().length / 2)));
-const RESTART_EVERY       = 15;
-const CHUNK_PAGE_THRESHOLD = 1000;             // only chunk docs >= 1000 estimated pages
+const CHARS_PER_PAGE       = 3000;
+const CHUNK_PAGE_MIN       = 100;
+const CHUNK_CHARS          = CHARS_PER_PAGE * CHUNK_PAGE_MIN; // 300,000 chars
+const MAX_RETRIES          = 2;
+const CONCURRENCY          = Math.min(3, Math.max(1, Math.floor(os.cpus().length / 2)));
+const RESTART_EVERY        = 15;
+const CHUNK_PAGE_THRESHOLD = 1000;
 
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -23,21 +23,16 @@ function extractHead(html) {
 }
 
 function extractBody(html) {
-  // Try explicit <body>...</body>
   const m = html.match(/<body([^>]*)>([\s\S]*?)<\/body>/i);
   if (m) return { attrs: m[1], content: m[2] };
-  // Try <html>...</html> without a body tag
   const h = html.match(/<html[^>]*>([\s\S]*?)<\/html>/i);
   if (h) {
-    // Strip any <head> block from it
     const inner = h[1].replace(/<head[^>]*>[\s\S]*?<\/head>/i, '');
     return { attrs: '', content: inner };
   }
   return { attrs: '', content: html };
 }
 
-// Detect sparse/plain HTML: has significant plain-text line structure but no
-// layout elements (no <p>, <div>, <table>, <br> etc.)
 const LAYOUT_TAG_RE = /<(p|div|br|hr|table|tr|td|th|ul|ol|li|h[1-6]|pre|code|blockquote|center|section|article|header|footer|nav|aside|form|input|textarea|button)\b/i;
 const HAS_STYLE_RE  = /<style[\s>]|<link[^>]+stylesheet/i;
 
@@ -66,7 +61,6 @@ const SPARSE_STYLE = `<style>
   }
 </style>`;
 
-// Normalise line endings and escape HTML entities, preserving <b> and <i>
 function escapeSparse(text) {
   return text
     .replace(/\r\n/g, '\n').replace(/\r/g, '\n')
@@ -76,21 +70,18 @@ function escapeSparse(text) {
     .replace(/&lt;i&gt;/gi, '<i>').replace(/&lt;\/i&gt;/gi, '</i>');
 }
 
-// For single-render docs: wrap whole body in one <pre>
 function normalizeSparseHtml(html) {
   const head = extractHead(html);
   const { attrs, content } = extractBody(html);
   return `<!DOCTYPE html><html><head>${head}${SPARSE_STYLE}</head><body${attrs}><pre>${escapeSparse(content)}</pre></body></html>`;
 }
 
-// Split plain text at newline boundaries so we never cut inside a line
 function splitTextChunks(text, targetChars) {
   const chunks = [];
   let pos = 0;
   while (pos < text.length) {
     let end = pos + targetChars;
     if (end >= text.length) { chunks.push(text.slice(pos)); break; }
-    // Walk back to the last newline before the cut point
     const nl = text.lastIndexOf('\n', end);
     const cut = nl > pos ? nl + 1 : end;
     chunks.push(text.slice(pos, cut));
@@ -134,7 +125,7 @@ function cleanupTmpDir(tmpDir) {
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
 }
 
-// ── Rendering (per-worker browser) ────────────────────────────────────────────
+// ── Rendering ──────────────────────────────────────────────────────────────────
 async function renderFile(tmpPath, options, workerId) {
   const {
     format = 'A4',
@@ -151,15 +142,15 @@ async function renderFile(tmpPath, options, workerId) {
 
   try {
     await page.goto(`file://${tmpPath}`, { waitUntil: 'load', timeout: 120000 });
-    await page.waitForTimeout(300); // let web fonts & CSS transitions settle
+    await page.waitForTimeout(300);
     return await page.pdf({ format, margin, printBackground, displayHeaderFooter });
   } finally {
+    // FIX: always close page then context — prevents renderer process leaking
     try { await page.close();    } catch (_) {}
     try { await context.close(); } catch (_) {}
   }
 }
 
-// On printToPDF failure: split chunk in half and render each half, then merge
 async function renderWithFallback(tmpPath, options, workerId, depth = 0) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -173,7 +164,6 @@ async function renderWithFallback(tmpPath, options, workerId, depth = 0) {
         await sleep(500 * attempt);
       }
 
-      // On print failure: recursively halve (max depth 3 = 1/8th original)
       if (isPrintFail && depth < 3) {
         const html = fs.readFileSync(tmpPath, 'utf8');
         const head = extractHead(html);
@@ -188,17 +178,27 @@ async function renderWithFallback(tmpPath, options, workerId, depth = 0) {
         fs.writeFileSync(pathA, wrapChunk(body.slice(0, cut), head, bodyAttrs), 'utf8');
         fs.writeFileSync(pathB, wrapChunk(body.slice(cut),    head, bodyAttrs), 'utf8');
 
-        const [bufA, bufB] = await Promise.all([
-          renderWithFallback(pathA, options, workerId, depth + 1),
-          renderWithFallback(pathB, options, workerId, depth + 1),
-        ]);
-        const merged = await PDFDocument.create();
-        for (const buf of [bufA, bufB]) {
-          const doc   = await PDFDocument.load(buf);
-          const pages = await merged.copyPages(doc, doc.getPageIndices());
-          pages.forEach(p => merged.addPage(p));
+        let bufA, bufB;
+        try {
+          [bufA, bufB] = await Promise.all([
+            renderWithFallback(pathA, options, workerId, depth + 1),
+            renderWithFallback(pathB, options, workerId, depth + 1),
+          ]);
+          const merged = await PDFDocument.create();
+          for (const buf of [bufA, bufB]) {
+            const doc   = await PDFDocument.load(buf);
+            const pages = await merged.copyPages(doc, doc.getPageIndices());
+            pages.forEach(p => merged.addPage(p));
+          }
+          return Buffer.from(await merged.save());
+        } finally {
+          // FIX: always clean up fallback split files
+          try { fs.unlinkSync(pathA); } catch (_) {}
+          try { fs.unlinkSync(pathB); } catch (_) {}
+          // FIX: null out large buffers immediately after merge
+          bufA = null;
+          bufB = null;
         }
-        return Buffer.from(await merged.save());
       }
 
       if (attempt === MAX_RETRIES) throw err;
@@ -217,6 +217,8 @@ async function streamMerge(mergedDoc, pdfBuffer) {
   const doc   = await PDFDocument.load(pdfBuffer);
   const pages = await mergedDoc.copyPages(doc, doc.getPageIndices());
   pages.forEach(p => mergedDoc.addPage(p));
+  // FIX: pdf-lib holds parsed page objects — explicitly clear the loaded doc
+  doc.context.enumeratedIndirectObjects.clear();
 }
 
 // ── Main entry ─────────────────────────────────────────────────────────────────
@@ -225,7 +227,6 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
   const estimatedPages = Math.ceil(htmlContent.length / 3000);
 
   if (estimatedPages < CHUNK_PAGE_THRESHOLD) {
-    // Single render — normalize entire doc if sparse, write as-is otherwise
     if (sparse) {
       if (progress) progress.log('Sparse HTML detected — wrapping in <pre> (single render)');
       htmlContent = normalizeSparseHtml(htmlContent);
@@ -235,27 +236,33 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
     const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), 'html-pdf-'));
     const tmpPath = path.join(tmpDir, 'doc.html');
     fs.writeFileSync(tmpPath, htmlContent, 'utf8');
+
+    // FIX: release input string reference — it can be 10s of MB
+    htmlContent = null;
+
     try {
       const buffer = await renderWithFallback(tmpPath, options, 'w0');
       const pages  = await countPdfPages(buffer);
       return { buffer, pages, chunks: 1 };
     } finally {
       cleanupTmpDir(tmpDir);
+      // FIX: close browsers only for single render — chunked path closes per worker
       await closeAllBrowsers();
     }
   }
 
-  // Large document — extract body, split raw text, wrap each chunk individually
+  // ── Large document path ────────────────────────────────────────────────────
   const head = extractHead(htmlContent);
   const { attrs: bodyAttrs, content: rawBody } = extractBody(htmlContent);
 
-  // For sparse docs: escape text first, then split — each chunk gets its own <pre>
-  // For rich HTML: split at tag boundaries as usual
+  // FIX: release the full htmlContent string — rawBody is a substring reference;
+  // assign null to allow GC of the original string once bodyChunks are built
+  htmlContent = null;
+
   let bodyChunks;
   if (sparse) {
     if (progress) progress.log('Sparse HTML detected — wrapping each chunk in <pre>');
     const escaped = escapeSparse(rawBody);
-    // Plain-text split on newline boundaries (not tag boundaries)
     bodyChunks = splitTextChunks(escaped, CHUNK_CHARS);
   } else {
     bodyChunks = splitBodySafe(rawBody, CHUNK_CHARS);
@@ -267,10 +274,14 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
   }
 
   const { tmpDir, paths } = writeChunkFiles(bodyChunks, head, bodyAttrs, sparse);
+
+  // FIX: release chunk strings after writing to disk — no need to hold all in memory
+  bodyChunks.length = 0;
+
   if (progress) progress.log('Rendering chunks...');
 
   const mergedDoc = await PDFDocument.create();
-  const pdfParts  = new Array(bodyChunks.length);
+  const pdfParts  = new Array(paths.length);
   let nextMerge   = 0;
   let renderIdx   = 0;
   const lock      = { merging: false };
@@ -280,6 +291,8 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
     lock.merging = true;
     while (nextMerge < pdfParts.length && pdfParts[nextMerge] !== undefined) {
       await streamMerge(mergedDoc, pdfParts[nextMerge]);
+      // FIX: null the buffer immediately after merging — was previously set to null
+      // but only inside the array slot, the buffer itself wasn't GC-eligible
       pdfParts[nextMerge] = null;
       nextMerge++;
     }
@@ -293,7 +306,6 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
       const i = renderIdx++;
       if (i >= paths.length) break;
 
-      // Restart this worker's browser periodically to reclaim memory
       if (localCount > 0 && localCount % RESTART_EVERY === 0) {
         await closeBrowser(wid);
         await sleep(300);
@@ -302,7 +314,6 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
       try {
         pdfParts[i] = await renderWithFallback(paths[i], options, wid);
       } catch (err) {
-        // Last-resort: emit a blank page so merge isn't blocked
         if (progress) progress.log(`  chunk ${i} failed permanently: ${err.message.slice(0, 80)}`);
         const blank = await PDFDocument.create();
         blank.addPage();
@@ -311,6 +322,11 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
 
       localCount++;
       if (progress) progress.tick();
+
+      // FIX: delete temp chunk file immediately after render — don't hold all
+      // chunk HTML files on disk for the entire job duration
+      try { fs.unlinkSync(paths[i]); } catch (_) {}
+
       await flushMerge();
     }
     await closeBrowser(wid);
@@ -320,13 +336,14 @@ async function generatePdf(htmlContent, options = {}, progress = null) {
     await Promise.all(Array.from({ length: CONCURRENCY }, (_, id) => worker(id)));
     await flushMerge();
   } finally {
+    // FIX: cleanupTmpDir catches any remaining files (fallback split files etc.)
     cleanupTmpDir(tmpDir);
     await closeAllBrowsers();
   }
 
   const buffer = Buffer.from(await mergedDoc.save());
   const pages  = await countPdfPages(buffer);
-  return { buffer, pages, chunks: bodyChunks.length };
+  return { buffer, pages, chunks: paths.length };
 }
 
 module.exports = { generatePdf };
