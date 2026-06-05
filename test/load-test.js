@@ -39,7 +39,7 @@ let activeCount  = 0;
 
 const results = {
   startTime:    Date.now(),
-  config:       { SERVER_URL, HTML_FILE, DURATION_MS, MAX_RESPONSE_MS, MAX_CPU_PCT, MAX_MEM_PCT },
+  config:       { SERVER_URL, HTML_FILE, DURATION_MS, MAX_RESPONSE_MS, MAX_CPU_PCT, MEM_WARN_PCT },
   intervals:    [],   // one entry per calibration window
   requests:     [],   // { startMs, durationMs, status, pages, error }
   summary:      null,
