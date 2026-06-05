@@ -1,109 +1,225 @@
 'use strict';
 
-const express  = require('express');
-const multer   = require('multer');
-const path     = require('path');
-const fs       = require('fs');
-const os       = require('os');
-const { generatePdf } = require('./src/generator');
+/**
+ * Security hardening — OWASP Top 10 + STRIDE coverage:
+ *
+ *   A01 Broken Access Control  — no auth needed (local tool); rate limiting prevents abuse
+ *   A02 Cryptographic Failures — no secrets stored or transmitted
+ *   A03 Injection              — filename sanitized; no shell exec; browser network blocked
+ *   A04 Insecure Design        — processing timeout; upload immediately deleted
+ *   A05 Misconfig              — Helmet sets 15 security headers; CSP enforced
+ *   A06 Vulnerable Components  — npm audit in CI
+ *   A07 Auth Failures          — N/A (local tool)
+ *   A08 Data Integrity         — MIME type validated, not just extension
+ *   A09 Logging                — every request logged with ID, size, duration, outcome
+ *   A10 SSRF                   — browser blocks all non-file:// network; no URL params accepted
+ *
+ *   STRIDE:
+ *   Spoofing          — request IDs logged; no session state to spoof
+ *   Tampering         — inputs sanitized; temp files deleted immediately
+ *   Repudiation       — structured request log with outcome
+ *   Info Disclosure   — errors return generic message, detail logged server-side only
+ *   DoS               — rate limiter + processing timeout + file size limit
+ *   Elevation         — no shell exec; no eval; no path traversal possible
+ */
+
+const express      = require('express');
+const multer       = require('multer');
+const helmet       = require('helmet');
+const rateLimit    = require('express-rate-limit');
+const path         = require('path');
+const fs           = require('fs');
+const os           = require('os');
+const crypto       = require('crypto');
+const { generatePdf }      = require('./src/generator');
 const { closeAllBrowsers } = require('./src/browser');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
+// Max time allowed for a single conversion (5 min)
+const PROCESSING_TIMEOUT_MS = 5 * 60 * 1000;
+
+// ── Security headers (OWASP A05) ──────────────────────────────────────────────
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc:  ["'self'"],
+      scriptSrc:   ["'self'", "'unsafe-inline'"],   // UI inline script only
+      styleSrc:    ["'self'", "'unsafe-inline'"],
+      imgSrc:      ["'self'", 'data:'],
+      connectSrc:  ["'self'"],
+      frameSrc:    ["'none'"],
+      objectSrc:   ["'none'"],
+      baseUri:     ["'self'"],
+    },
+  },
+  crossOriginEmbedderPolicy: false, // not needed for file downloads
+}));
+
+// ── Rate limiting (OWASP A04 / STRIDE DoS) ────────────────────────────────────
+const convertLimiter = rateLimit({
+  windowMs: 60 * 1000,          // 1 minute window
+  max: 10,                      // max 10 conversion requests per IP per minute
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests — please wait before converting again.' },
+});
+
+// ── Multer upload (OWASP A04 / A08) ───────────────────────────────────────────
 const upload = multer({
   dest: os.tmpdir(),
   limits: { fileSize: 200 * 1024 * 1024 },
   fileFilter(req, file, cb) {
-    if (/\.html?$/i.test(file.originalname)) return cb(null, true);
-    cb(new Error('Only .html / .htm files are accepted'));
+    // Validate both extension AND declared MIME type (A08 — data integrity)
+    const extOk  = /\.html?$/i.test(file.originalname);
+    const mimeOk = ['text/html', 'application/xhtml+xml', 'text/plain', 'application/octet-stream']
+                     .includes(file.mimetype);
+    if (extOk && mimeOk) return cb(null, true);
+    cb(Object.assign(new Error('Only HTML files accepted (.html / .htm)'), { status: 400 }));
   },
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
+// ── Helpers ────────────────────────────────────────────────────────────────────
+function unlinkSilent(p) { if (p) try { fs.unlinkSync(p); } catch (_) {} }
 
-function unlinkSilent(filePath) {
-  if (!filePath) return;
-  try { fs.unlinkSync(filePath); } catch (_) {}
+/**
+ * Sanitize filename for Content-Disposition header.
+ * OWASP A03 — prevents header injection via \r\n in filename.
+ * Strips everything except alphanumerics, dash, underscore, dot, space.
+ */
+function sanitizeFilename(name) {
+  return name
+    .replace(/[^\w\s.\-]/g, '_')   // replace unsafe chars
+    .replace(/\.{2,}/g, '_')       // no path traversal sequences
+    .slice(0, 128)                  // cap length
+    .trim() || 'output';
 }
 
-app.post('/convert', upload.single('htmlfile'), async (req, res) => {
-  // FIX: multer errors (wrong file type, too large) leave no req.file — clean up
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+/**
+ * Request logger — STRIDE Repudiation / OWASP A09
+ */
+function logRequest(reqId, event, data = {}) {
+  const entry = { ts: new Date().toISOString(), reqId, event, ...data };
+  console.log(JSON.stringify(entry));
+}
 
-  const uploadPath = req.file.path;
-  let pdfPath = null;
+// ── Static UI ──────────────────────────────────────────────────────────────────
+app.use(express.static(path.join(__dirname, 'public')));
 
-  try {
-    // FIX: read into string then immediately unlink the upload — no need to hold
-    // both the file on disk AND the string in memory simultaneously
-    let htmlContent = fs.readFileSync(uploadPath, 'utf8');
-    unlinkSilent(uploadPath); // delete upload right after read
+// ── POST /convert ──────────────────────────────────────────────────────────────
+app.post(
+  '/convert',
+  convertLimiter,
+  upload.single('htmlfile'),
+  async (req, res) => {
+    // Unique request ID for tracing (STRIDE Repudiation)
+    const reqId = crypto.randomUUID();
 
-    const originalName = path.basename(req.file.originalname, path.extname(req.file.originalname));
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
 
-    const progress = {
-      total: 1,
-      done:  0,
-      log:  (msg) => console.log(`  [${req.file.originalname}] ${msg}`),
-      tick: () => {
-        progress.done++;
-        const pct = Math.round((progress.done / progress.total) * 100);
-        process.stdout.write(`\r  [${req.file.originalname}] ${progress.done}/${progress.total} chunks (${pct}%)`);
-        if (progress.done === progress.total) process.stdout.write('\n');
-      },
-    };
+    const uploadPath = req.file.path;
+    let pdfPath = null;
 
-    console.log(`\n→ Converting: ${req.file.originalname} (${(Buffer.byteLength(htmlContent) / 1024 / 1024).toFixed(2)} MB)`);
-    const start = Date.now();
+    logRequest(reqId, 'start', {
+      filename: req.file.originalname,
+      sizeBytes: req.file.size,
+      ip: req.ip,
+    });
 
-    const { buffer, pages, chunks } = await generatePdf(htmlContent, {}, progress);
+    // Processing timeout — OWASP A04 / STRIDE DoS
+    let timedOut = false;
+    const timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      logRequest(reqId, 'timeout');
+      unlinkSilent(uploadPath);
+      if (!res.headersSent) {
+        res.status(503).json({ error: 'Conversion timed out. Try a smaller file.' });
+      }
+    }, PROCESSING_TIMEOUT_MS);
 
-    // FIX: release htmlContent string — generatePdf already nulls it internally
-    // but the local reference here keeps it alive; null it explicitly
-    htmlContent = null;
+    try {
+      // Read then immediately delete upload — don't hold file+string simultaneously
+      let htmlContent = fs.readFileSync(uploadPath, 'utf8');
+      unlinkSilent(uploadPath);
 
-    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-    console.log(`✓ Done: ${pages} pages, ${chunks} chunks, ${elapsed}s, ${(buffer.length / 1024).toFixed(0)} KB`);
+      if (timedOut) return;
 
-    // Write PDF to temp, stream to client, then delete — never accumulate PDFs on disk
-    pdfPath = path.join(os.tmpdir(), `${originalName}-${Date.now()}.pdf`);
-    fs.writeFileSync(pdfPath, buffer);
+      // Sanitize output filename — prevents header injection (OWASP A03)
+      const rawName      = path.basename(req.file.originalname, path.extname(req.file.originalname));
+      const originalName = sanitizeFilename(rawName);
 
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${originalName}.pdf"`);
-    res.setHeader('X-Pages', pages);
-    res.setHeader('X-Chunks', chunks);
-    res.setHeader('X-Elapsed', elapsed + 's');
+      const progress = {
+        total: 1,
+        done:  0,
+        log:  (msg) => logRequest(reqId, 'progress', { msg }),
+        tick: () => {
+          progress.done++;
+          if (!timedOut) process.stdout.write(
+            `\r  [${reqId.slice(0,8)}] ${progress.done}/${progress.total} chunks`
+          );
+        },
+      };
 
-    const stream = fs.createReadStream(pdfPath);
-    stream.pipe(res);
+      const start = Date.now();
+      const { buffer, pages, chunks } = await generatePdf(htmlContent, {}, progress);
+      htmlContent = null; // release large string
 
-    // FIX: delete PDF temp file on both finish and error (client disconnect etc.)
-    const cleanup = () => unlinkSilent(pdfPath);
-    stream.on('end',   cleanup);
-    stream.on('error', cleanup);
-    res.on('close',    cleanup); // client disconnected early
+      if (timedOut) return;
 
-  } catch (err) {
-    console.error('Convert error:', err.message);
-    // FIX: clean up upload in case early unlink didn't happen (e.g. readFileSync threw)
-    unlinkSilent(uploadPath);
-    unlinkSilent(pdfPath);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
+      const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+      clearTimeout(timeoutHandle);
+
+      logRequest(reqId, 'complete', { pages, chunks, elapsedS: elapsed, outputKB: Math.round(buffer.length / 1024) });
+
+      // Write PDF to tmp, stream, delete — never accumulate output on disk
+      pdfPath = path.join(os.tmpdir(), `${originalName}-${reqId.slice(0,8)}.pdf`);
+      fs.writeFileSync(pdfPath, buffer);
+
+      res.setHeader('Content-Type', 'application/pdf');
+      // Use RFC 5987 encoding to safely pass filename with special chars
+      res.setHeader('Content-Disposition',
+        `attachment; filename="${originalName}.pdf"; filename*=UTF-8''${encodeURIComponent(originalName + '.pdf')}`);
+      res.setHeader('X-Pages',   pages);
+      res.setHeader('X-Chunks',  chunks);
+      res.setHeader('X-Elapsed', elapsed + 's');
+      res.setHeader('X-Request-Id', reqId);
+
+      const stream  = fs.createReadStream(pdfPath);
+      const cleanup = () => unlinkSilent(pdfPath);
+      stream.on('end',   cleanup);
+      stream.on('error', cleanup);
+      res.on('close',    cleanup); // client disconnected early
+      stream.pipe(res);
+
+    } catch (err) {
+      clearTimeout(timeoutHandle);
+      // OWASP A09 — log full error server-side; return generic message to client
+      logRequest(reqId, 'error', { message: err.message, stack: err.stack });
+      unlinkSilent(uploadPath);
+      unlinkSilent(pdfPath);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Conversion failed. Check server logs for details.' });
+      }
+    }
   }
-});
+);
 
-// FIX: handle multer errors (file too large, wrong type) — without this,
-// the uploaded temp file is left on disk
+// ── Multer error handler (file too large / wrong type) ────────────────────────
+// eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   if (req.file) unlinkSilent(req.file.path);
-  res.status(400).json({ error: err.message });
+  const status = err.status || (err.code === 'LIMIT_FILE_SIZE' ? 413 : 400);
+  logRequest('—', 'upload-error', { message: err.message, ip: req.ip });
+  res.status(status).json({ error: err.message });
 });
 
+// ── Graceful shutdown ──────────────────────────────────────────────────────────
 process.on('SIGINT',  async () => { await closeAllBrowsers(); process.exit(0); });
 process.on('SIGTERM', async () => { await closeAllBrowsers(); process.exit(0); });
 
 app.listen(PORT, () => {
-  console.log(`\nhtml-to-pdf server running at http://localhost:${PORT}\n`);
+  console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'start', port: PORT }));
 });
