@@ -154,20 +154,33 @@ function printRow(elapsed, stats, action) {
 }
 
 // ── Worker loop ────────────────────────────────────────────────────────────────
-let requestQueue = Promise.resolve();
+// Consecutive connection-refused errors — used for back-off
+let consecutiveConnErrors = 0;
 
-function spawnWorker() {
+async function spawnWorker() {
   if (!running) return;
   if (activeCount >= concurrency) return;
 
   activeCount++;
-  convertRequest().then(rec => {
+  try {
+    const rec = await convertRequest();
     results.requests.push(rec);
-    rtWindow.push(rec.durationMs);
-    if (rtWindow.length > SAMPLE_WINDOW) rtWindow.shift();
+
+    if (rec.error && /ECONNREFUSED|ECONNRESET|fetch failed/i.test(rec.error)) {
+      consecutiveConnErrors++;
+      // Exponential back-off up to 10s when server is unreachable
+      const backoff = Math.min(10000, 500 * Math.pow(2, consecutiveConnErrors - 1));
+      console.log(`\n  ⚠ Server unreachable (${rec.error}) — waiting ${backoff}ms before retry`);
+      await new Promise(r => setTimeout(r, backoff));
+    } else {
+      consecutiveConnErrors = 0;
+      rtWindow.push(rec.durationMs);
+      if (rtWindow.length > SAMPLE_WINDOW) rtWindow.shift();
+    }
+  } finally {
     activeCount--;
     if (running) spawnWorker();
-  });
+  }
 }
 
 function fillWorkers() {
@@ -175,11 +188,31 @@ function fillWorkers() {
   for (let i = 0; i < slots; i++) spawnWorker();
 }
 
+// ── Pre-flight health check ────────────────────────────────────────────────────
+async function healthCheck() {
+  try {
+    const res = await fetch(`${SERVER_URL}/`, { method: 'GET', signal: AbortSignal.timeout(5000) });
+    return res.ok || res.status === 200;
+  } catch {
+    return false;
+  }
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────────
 async function run() {
   console.log(`\nStarting load test → ${SERVER_URL}`);
   console.log(`File: ${HTML_FILE} (${(fileBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
-  console.log(`Duration: 1 hour  |  Calibrate every: ${CALIBRATE_EVERY_MS / 1000}s\n`);
+  console.log(`Duration: 1 hour  |  Calibrate every: ${CALIBRATE_EVERY_MS / 1000}s`);
+
+  // Pre-flight: verify server is up before starting
+  process.stdout.write('\nChecking server… ');
+  const alive = await healthCheck();
+  if (!alive) {
+    console.error(`\n✗ Server not reachable at ${SERVER_URL}`);
+    console.error('  Start the server first: node server.js\n');
+    process.exit(1);
+  }
+  console.log('✓ Server is up\n');
 
   printHeader();
 
