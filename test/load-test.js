@@ -107,8 +107,8 @@ function calibrate(intervalStats) {
   const { avgRtMs, cpuPct, memPct, successRate } = intervalStats;
   const old = concurrency;
 
-  const overloaded = avgRtMs > RT_SCALE_DOWN_MS || cpuPct > MAX_CPU_PCT || memPct > MAX_MEM_PCT;
-  const healthy    = avgRtMs < RT_SCALE_UP_MS   && cpuPct < MAX_CPU_PCT * 0.8 && memPct < MAX_MEM_PCT * 0.8 && successRate === 1;
+  const overloaded = avgRtMs > RT_SCALE_DOWN_MS || cpuPct > MAX_CPU_PCT;
+  const healthy    = avgRtMs < RT_SCALE_UP_MS   && cpuPct < MAX_CPU_PCT * 0.8 && successRate === 1;
 
   if (overloaded && concurrency > CONCURRENCY_MIN) {
     concurrency = Math.max(CONCURRENCY_MIN, Math.floor(concurrency * 0.7));
