@@ -110,7 +110,8 @@ function calibrate(intervalStats) {
   const old = concurrency;
 
   const hasEnoughSamples = ok >= MIN_REQS_TO_SCALE_UP;
-  const overloaded = (hasEnoughSamples && avgRtMs > RT_SCALE_DOWN_MS) || cpuPct > MAX_CPU_PCT;
+  const zeroSuccess      = windowOkReqs === 0 && intervalStats.windowReqs >= MIN_REQS_TO_SCALE_UP;
+  const overloaded = zeroSuccess || (hasEnoughSamples && avgRtMs > RT_SCALE_DOWN_MS) || cpuPct > MAX_CPU_PCT;
   const healthy    = hasEnoughSamples && avgRtMs < RT_SCALE_UP_MS && cpuPct < MAX_CPU_PCT * 0.8 && successRate === 1;
 
   if (overloaded && concurrency > CONCURRENCY_MIN) {
@@ -168,12 +169,15 @@ async function spawnWorker() {
 
     if (rec.error && /ECONNREFUSED|ECONNRESET|fetch failed/i.test(rec.error)) {
       consecutiveConnErrors++;
-      // Exponential back-off up to 10s when server is unreachable
       const backoff = Math.min(10000, 500 * Math.pow(2, consecutiveConnErrors - 1));
-      console.log(`\n  ⚠ Server unreachable (${rec.error}) — waiting ${backoff}ms before retry`);
+      console.log(`\n  ⚠ Server unreachable (${rec.error}) — waiting ${backoff}ms`);
       await new Promise(r => setTimeout(r, backoff));
     } else {
       consecutiveConnErrors = 0;
+    }
+    // Track RT for ALL requests (including 429/errors) so AvgRT is never 0ms
+    // when requests are completing but failing — gives calibration real signal
+    if (rec.durationMs > 0) {
       rtWindow.push(rec.durationMs);
       if (rtWindow.length > SAMPLE_WINDOW) rtWindow.shift();
     }

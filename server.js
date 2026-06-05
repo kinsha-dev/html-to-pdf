@@ -59,8 +59,11 @@ app.use(helmet({
 
 // ── Rate limiting (OWASP A04 / STRIDE DoS) ────────────────────────────────────
 const convertLimiter = rateLimit({
-  windowMs: 60 * 1000,          // 1 minute window
-  max: 10,                      // max 10 conversion requests per IP per minute
+  windowMs: 60 * 1000,
+  // LOAD_TEST=1 raises limit to 1000/min so the test runner isn't throttled.
+  // Keep at 10 for public-facing deployments.
+  max: process.env.LOAD_TEST === '1' ? 1000 : 10,
+  skip: (req) => req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1',
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests — please wait before converting again.' },
